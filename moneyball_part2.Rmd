@@ -1,0 +1,162 @@
+---
+title: "Untitled"
+author: "datadavidz"
+date: "4/30/2021"
+output: html_document
+---
+
+My own version of TidyX Episode 54 where we do KNN and UMAP clustering of Pitch F/X data
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(tidymodels)
+library(here)
+library(lubridate)
+
+here::i_am("moneyball_part2.Rmd")
+```
+
+Load data, minor preprocessing, and do the train/test split using rsample methodology.
+Calculation of the split proportion by date/time could be simplified to just taking 2/3 but wanted to be consistent with TidyX.
+```{r}
+#training
+set1 <- readRDS(file = here("data", "2016_04_21_to_2016_04_23_pitch.rds"))
+set2 <- readRDS(file = here("data", "2016_04_24_to_2016_04_26_pitch.rds"))
+#testing
+set3 <- readRDS(file = here("data", "2016_04_27_to_2016_04_30_pitch.rds"))
+
+#Keeping date and time
+pitch_raw <- set1 %>%
+  bind_rows(set2) %>%
+  bind_rows(set3) %>%
+  mutate(pitch_date = str_replace(y, "T", " "),
+         pitch_date = str_remove(pitch_date, "\\..*$"),
+         pitch_date = ymd_hms(pitch_date))
+
+#Need to know the max date for set 2 for splitting purpose
+set2_max_date <- set2 %>%
+  mutate(pitch_date = str_replace(y, "T", " "),
+         pitch_date = str_remove(pitch_date, "\\..*$"),
+         pitch_date = ymd_hms(pitch_date)) %>%
+  summarize(max_date = max(pitch_date, na.rm = TRUE)) %>%
+  pluck(., 1)
+
+pitch_clean <- pitch_raw %>%
+  filter(!pitch_type %in% c("KN", "IN", "PO", "EP", "FO", "SC"),
+         !is.na(pitch_type)) %>%
+  select(pitch_date, pitch_type, start_speed, end_speed, pfx_x, pfx_z, px, pz, x0, z0, vx0, vz0) %>%
+  drop_na()
+
+prop <- nrow(pitch_clean %>% filter(pitch_date <= set2_max_date )) / nrow(pitch_clean)
+```
+
+Create the initial split based on time (like done for TidyX)
+```{r}
+pitch_split <- initial_time_split(data = pitch_clean, prop = prop)
+pitch_train <- training(pitch_split)
+pitch_test <- testing(pitch_split)
+```
+
+Create the recipe
+```{r}
+pitch_rec <- recipe(pitch_type ~ ., data = pitch_train) %>%
+  update_role(pitch_date, new_role = "id") %>%
+  step_normalize(all_numeric()) %>%
+  prep()
+
+pitch_rec
+```
+
+Create cross-validation folds for tuning
+```{r}
+set.seed(234)
+
+pitch_folds <- vfold_cv(pitch_train, v = 10)
+
+pitch_folds
+```
+
+
+Create the model specification
+```{r}
+knn_spec <- nearest_neighbor(neighbors = tune()) %>%
+  set_engine("kknn") %>%
+  set_mode("classification")
+```
+
+Create the tune grid
+```{r}
+knn_grid <- grid_regular(neighbors(), levels = 10)
+
+knn_grid
+```
+
+Create the workflow
+```{r}
+knn_wf <- workflow() %>%
+  add_recipe(pitch_rec) %>%
+  add_model(knn_spec)
+```
+
+Tune the nearest neighbors using folds
+```{r}
+doParallel::registerDoParallel()
+
+knn_tune <- tune_grid(
+  knn_wf,
+  resamples = pitch_folds,
+  grid = knn_grid,
+  metrics = metric_set(accuracy, kap)
+)
+```
+
+Analyze tune results
+```{r}
+knn_tune %>% show_best("kap", n = 5)
+knn_tune %>% show_best("accuracy", n = 5)
+
+knn_tune %>% autoplot()
+```
+
+Finalize neighbors parameter at 8.
+```{r}
+knn_final_wf <- knn_wf %>% finalize_workflow(tibble(neighbors = 8))
+```
+
+```{r}
+knn_final_fit <- knn_final_wf %>% last_fit(pitch_split, metrics = metric_set(accuracy, kap))
+
+knn_final_fit %>% collect_metrics()
+```
+
+Show the confusion matrix for pitch predictions
+```{r}
+knn_final_fit %>% collect_predictions() %>% conf_mat(truth = pitch_type, estimate = .pred_class)
+
+```
+```{r}
+knn_final_fit %>% collect_predictions() %>% conf_mat(truth = pitch_type, estimate = .pred_class) %>% summary()
+```
+
+
+Misclassification rate by pitch
+```{r}
+knn_final_fit %>% 
+  collect_predictions() %>% 
+  select(observed = pitch_type, predicted = .pred_class) %>%
+  group_by(observed, predicted) %>%
+  summarize(freq = n(), .groups = "drop") %>%
+  group_by(observed) %>%
+  summarize(mcr = 1- freq[observed == predicted] / sum(freq), 
+            n = sum(freq), .groups = "drop")
+```
+
+### UMAP
+
+UMAP can be performed as a preprocessing step (recipe) in tidymodels framework using the ```embed``` library.
+
+```{r}
+
+```
+
