@@ -1,5 +1,5 @@
 ---
-title: "Untitled"
+title: "Moneyball Part 3"
 author: "datadavidz"
 date: "5/11/2021"
 output: html_document
@@ -15,6 +15,7 @@ library(here)
 library(lubridate)
 
 library(rpart.plot)
+library(vip)
 
 here::i_am("moneyball_part2.Rmd")
 ```
@@ -109,13 +110,154 @@ rpart_fit %>% collect_predictions() %>% conf_mat(truth = pitch_type, estimate = 
 
 ### Random Forest Model
 
+Same data and split as above
 
+Create the recipe
+```{r}
+rf_rec <- recipe(pitch_type ~ ., data = pitch_train) %>%
+  update_role(pitch_date, new_role = "id") %>%
+  prep()
 
+rf_rec
+```
 
+Specify the decision tree model
+```{r}
+rf_spec <- rand_forest(mtry = 6) %>%
+   set_engine("randomForest") %>%
+   set_mode("classification")
 
+rf_spec
+```
 
+Create the workflow
+```{r}
+rf_wf <- workflow() %>%
+  add_recipe(rf_rec) %>%
+  add_model(rf_spec)
+```
 
+Fit the decision tree
+```{r}
+set.seed(567)
 
+rf_res <- fit(rf_wf, data = pitch_train)
+
+rf_res
+```
+Variable importance plot
+```{r}
+vip(rf_res$fit$fit$fit, geom = "point", aesthetics = list(color = "steelblue")) +
+  labs(title = "Pitch F/X Variable Importance for Random Forest Model")
+```
+
+```{r}
+rf_fit <- rf_wf %>% last_fit(pitch_split, metrics = metric_set(accuracy, kap))
+
+rf_fit %>% collect_metrics()
+```
+
+```{r}
+rf_fit %>% collect_predictions() %>% conf_mat(truth = pitch_type, estimate = .pred_class) %>% summary()
+```
+
+Within class accuracy
+```{r}
+rf_fit %>% 
+  collect_predictions() %>% 
+  select(pitch_type, predicted = .pred_class) %>%
+  count(pitch_type, predicted) %>%
+  group_by(pitch_type) %>%
+  summarize(N = sum(n),
+            matches = sum(ifelse(pitch_type == predicted, n, 0)),
+            within_acc = matches / N, 
+            .groups = "drop")
+```
+
+### Tune the Random Forest Model
+
+Never do in this order but we'll go back and tune a random forest model. Data, split, recipe is all the same.
+
+Create cross-validation folds for tuning
+```{r}
+set.seed(234)
+
+pitch_folds <- vfold_cv(pitch_train, v = 5)
+pitch_folds
+```
+
+Create the model spec for tuning
+```{r}
+rf_tune_spec <- rand_forest(mtry = tune()) %>%
+   set_engine("randomForest") %>%
+   set_mode("classification")
+
+rf_tune_spec
+```
+
+Create the tune grid
+```{r}
+rf_grid <- grid_regular(mtry(c(3L, 7L)), levels = 5)
+
+rf_grid
+```
+
+Create the workflow
+```{r}
+rf_tune_wf <- workflow() %>%
+  add_recipe(rf_rec) %>%
+  add_model(rf_tune_spec)
+```
+
+Tune the random forest using folds
+```{r}
+doParallel::registerDoParallel()
+
+rf_tune <- tune_grid(
+  rf_tune_wf,
+  resamples = pitch_folds,
+  grid = rf_grid,
+  metrics = metric_set(accuracy, kap)
+)
+```
+
+Analyze tune results
+```{r}
+rf_tune %>% show_best("kap", n = 5)
+rf_tune %>% show_best("accuracy", n = 5)
+
+rf_tune %>% autoplot()
+```
+
+Finalize neighbors parameter at 5.  This could also be done by select_best but to be consistent with TidyX we use 5.
+```{r}
+rf_final_wf <- rf_tune_wf %>% finalize_workflow(tibble(mtry = 5))
+```
+
+Final fit with split and mtry = 5
+```{r}
+rf_final_fit <- rf_final_wf %>% last_fit(pitch_split, metrics = metric_set(accuracy, kap))
+
+rf_final_fit %>% collect_metrics()
+```
+
+More detailed summary statistics
+```{r}
+rf_final_fit %>% collect_predictions() %>% conf_mat(truth = pitch_type, estimate = .pred_class) %>% summary()
+```
+
+Within class accuracy
+```{r}
+rf_final_fit %>% 
+  collect_predictions() %>% 
+  select(pitch_type, predicted = .pred_class) %>%
+  count(pitch_type, predicted) %>%
+  group_by(pitch_type) %>%
+  summarize(N = sum(n),
+            matches = sum(ifelse(pitch_type == predicted, n, 0)),
+            within_acc = matches / N, 
+            .groups = "drop")
+```
 
 
 
