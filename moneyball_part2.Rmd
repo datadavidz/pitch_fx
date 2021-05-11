@@ -14,6 +14,8 @@ library(tidymodels)
 library(here)
 library(lubridate)
 
+library(embed) #for UMAP
+
 here::i_am("moneyball_part2.Rmd")
 ```
 
@@ -119,7 +121,7 @@ knn_tune %>% show_best("accuracy", n = 5)
 knn_tune %>% autoplot()
 ```
 
-Finalize neighbors parameter at 8.
+Finalize neighbors parameter at 8.  This could also be done by select_best but to be consistent with TidyX we use 8.
 ```{r}
 knn_final_wf <- knn_wf %>% finalize_workflow(tibble(neighbors = 8))
 ```
@@ -157,6 +159,32 @@ knn_final_fit %>%
 UMAP can be performed as a preprocessing step (recipe) in tidymodels framework using the ```embed``` library.
 
 ```{r}
+umap_rec <- recipe(~ ., data = pitch_train) %>% #no outcome - unsupervised learning
+  update_role(pitch_type, pitch_date, new_role = "id") %>%
+  step_normalize(all_predictors()) %>%
+  step_umap(all_predictors()) %>%
+  prep()
+```
 
+```{r}
+pitch_conv <- tribble(~pitch_type, ~pitch_label,
+                      "CH", "Change-up",
+                      "CU", "Curveball",
+                      "FC", "Cutter",
+                      "FF", "Four-seam Fastball",
+                      "FS", "Split-finger Fastball",
+                      "FT", "Two-seam Fastball",
+                      "KC", "Knuckle Curve",
+                      "SI", "Sinker",
+                      "SL", "Slider")
+```
+
+Create a plot to analyze the umap projection
+```{r}
+juice(umap_rec) %>%
+  left_join(pitch_conv, by = "pitch_type") %>%
+  ggplot(aes(umap_1, umap_2)) +
+  geom_point(aes(color = pitch_label), alpha = 0.7, size = 2) +
+  labs(color = NULL)
 ```
 
