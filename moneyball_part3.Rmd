@@ -17,7 +17,7 @@ library(lubridate)
 library(rpart.plot)
 library(vip)
 
-here::i_am("moneyball_part2.Rmd")
+here::i_am("moneyball_part3.Rmd")
 ```
 
 Load data, minor preprocessing, and do the train/test split using rsample methodology.
