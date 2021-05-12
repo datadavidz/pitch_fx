@@ -1,0 +1,216 @@
+---
+title: "Moneyball Part 4"
+author: "datadavidz"
+date: "5/12/2021"
+output: html_document
+---
+
+My own version of TidyX Episode 56 where we create a predictive model based on xgboost for classifying pitches.
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(tidymodels)
+library(here)
+library(lubridate)
+
+library(vip)
+
+here::i_am("moneyball_part4.Rmd")
+```
+
+Load data, minor preprocessing, and do the train/test split using rsample methodology.
+Calculation of the split proportion by date/time could be simplified to just taking 2/3 but wanted to be consistent with TidyX.
+```{r}
+#training
+set1 <- readRDS(file = here("data", "2016_04_21_to_2016_04_23_pitch.rds"))
+set2 <- readRDS(file = here("data", "2016_04_24_to_2016_04_26_pitch.rds"))
+#testing
+set3 <- readRDS(file = here("data", "2016_04_27_to_2016_04_30_pitch.rds"))
+
+#Keeping date and time
+pitch_raw <- set1 %>%
+  bind_rows(set2) %>%
+  bind_rows(set3) %>%
+  mutate(pitch_date = str_replace(y, "T", " "),
+         pitch_date = str_remove(pitch_date, "\\..*$"),
+         pitch_date = ymd_hms(pitch_date))
+
+#Need to know the max date for set 2 for splitting purpose
+set2_max_date <- set2 %>%
+  mutate(pitch_date = str_replace(y, "T", " "),
+         pitch_date = str_remove(pitch_date, "\\..*$"),
+         pitch_date = ymd_hms(pitch_date)) %>%
+  summarize(max_date = max(pitch_date, na.rm = TRUE)) %>%
+  pluck(., 1)
+
+pitch_clean <- pitch_raw %>%
+  filter(!pitch_type %in% c("KN", "IN", "PO", "EP", "FO", "SC"),
+         !is.na(pitch_type)) %>%
+  select(pitch_date, pitch_type, start_speed, end_speed, pfx_x, pfx_z, px, pz, x0, z0, vx0, vz0) %>%
+  drop_na()
+
+prop <- nrow(pitch_clean %>% filter(pitch_date <= set2_max_date )) / nrow(pitch_clean)
+```
+
+Create the initial split based on time (like done for TidyX)
+```{r}
+pitch_split <- initial_time_split(data = pitch_clean, prop = prop)
+pitch_train <- training(pitch_split)
+pitch_test <- testing(pitch_split)
+```
+
+Create the recipe
+```{r}
+xgb_rec <- recipe(pitch_type ~ ., data = pitch_train) %>%
+  update_role(pitch_date, new_role = "id") %>%
+  prep()
+
+xgb_rec
+```
+
+Specify the xgboost model
+```{r}
+xgb_spec <- boost_tree(
+  trees = 1000,
+  tree_depth = 3,
+  stop_iter = 10
+  ) %>%
+   set_engine("xgboost", objective = "multi:softprob") %>%
+   set_mode("classification")
+
+xgb_spec
+```
+
+Create the workflow
+```{r}
+xgb_wf <- workflow() %>%
+  add_recipe(xgb_rec) %>%
+  add_model(xgb_spec)
+```
+
+Fit the xgboost model without tuning.
+```{r}
+doParallel::registerDoParallel()
+
+set.seed(567)
+
+xgb_res <- last_fit(xgb_wf, split = pitch_split, metrics = metric_set(accuracy, kap, mn_log_loss))
+
+xgb_res
+```
+
+Summary of fit results.
+```{r}
+xgb_res %>% collect_metrics()
+```
+Show the confusion matrix.
+```{r}
+xgb_res %>% collect_predictions() %>%
+  conf_mat(truth = pitch_type, estimate = .pred_class)
+```
+
+### Tune the xgboost model
+
+Never do in this order but we'll go back and tune an xgboost model. Data, split, recipe is all the same.
+
+Create cross-validation folds for tuning
+```{r}
+set.seed(234)
+
+pitch_folds <- vfold_cv(pitch_train, v = 3)
+pitch_folds
+```
+
+
+Specify the xgboost model for tuning.
+```{r}
+xgb_tune_spec <- boost_tree(
+  trees = 1000, #nrounds
+  tree_depth = tune(), #max_depth
+  stop_iter = 10, #early_stopping rounds
+  learn_rate = 0.01, #eta
+  loss_reduction = 0, #gamma
+  mtry = 1, #colsample_bytree
+  min_n = 1, #min_child_weight
+  sample_size = 1 #sub_sample
+  ) %>%
+   set_engine("xgboost", objective = "multi:softprob") %>%
+   set_mode("classification")
+
+xgb_tune_spec
+```
+Create the tune grid
+```{r}
+xgb_grid <- grid_regular(tree_depth(c(2L, 8L)), levels = 4)
+
+xgb_grid
+```
+
+Create the workflow
+```{r}
+xgb_tune_wf <- workflow() %>%
+  add_recipe(xgb_rec) %>%
+  add_model(xgb_tune_spec)
+
+xgb_tune_wf
+```
+Tune the xgboost model using folds
+```{r}
+doParallel::registerDoParallel()
+
+begin <- Sys.time()
+
+xgb_tune <- tune_grid(
+  xgb_tune_wf,
+  resamples = pitch_folds,
+  grid = xgb_grid,
+  metrics = metric_set(accuracy, kap, mn_log_loss)
+)
+
+end1 <- Sys.time() - begin
+```
+
+Analyze tune results
+```{r}
+xgb_tune %>% show_best("kap", n = 5)
+xgb_tune %>% show_best("accuracy", n = 5)
+xgb_tune %>% show_best("mn_log_loss", n = 5)
+
+xgb_tune %>% autoplot()
+```
+
+Finalize tree depth at 8 using select_best
+```{r}
+xgb_final_wf <- xgb_tune_wf %>% finalize_workflow(xgb_tune %>% select_best("accuracy"))
+
+xgb_final_wf
+```
+
+Final fit with split and tree_depth = 8.
+```{r}
+xgb_final_fit <- xgb_final_wf %>% last_fit(pitch_split, metrics = metric_set(accuracy, kap, mn_log_loss))
+
+xgb_final_fit %>% collect_metrics()
+```
+
+Within class accuracy
+```{r}
+xgb_final_fit %>% 
+  collect_predictions() %>% 
+  select(pitch_type, predicted = .pred_class) %>%
+  count(pitch_type, predicted) %>%
+  group_by(pitch_type) %>%
+  summarize(N = sum(n),
+            matches = sum(ifelse(pitch_type == predicted, n, 0)),
+            within_acc = matches / N, 
+            .groups = "drop")
+```
+
+Variable importance plot
+```{r}
+xgb_final_fit$.workflow[[1]] %>% pull_workflow_fit() %>%
+  vip(aesthetics = list(fill = "steelblue")) +
+  labs(title = "XGBoost Model Importance - Pitch Type Prediction")
+```
+
